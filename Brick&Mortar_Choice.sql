@@ -538,8 +538,7 @@ ORDER BY
 
 -- California was excluded despite high market gap values because target cities are
 -- geographically close to existing reseller hubs, which would likely lead to channel
--- conflict and internal competition (e.g., similar to opening a store in Almada while
--- having strong reseller presence in Lisbon).
+-- conflict and internal competition.
 
 -- Maryland represents an emerging market with no reseller presence, minimizing
 -- cannibalization risk. Baltimore, as the top city in terms of online sales within the state,
