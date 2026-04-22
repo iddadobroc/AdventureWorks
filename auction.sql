@@ -61,12 +61,25 @@ CREATE TABLE Auction.Auction
     AuctionID INT IDENTITY PRIMARY KEY NOT NULL,
     ProductID INT NOT NULL REFERENCES Auction.Product(ProductID),
     InitialBidPrice MONEY NOT NULL DEFAULT 0,
-    ExpireDate DATE,
+    ExpireDate DATE,---The bid logic asks fot the timestamp with exat date and time, maybe change it to ExpireDate DATETIME2(0),
     AuctionStatus NVARCHAR(20) NOT NULL DEFAULT 'Active',
     ListedDate DATETIME NOT NULL DEFAULT GETUTCDATE(),
     UpdatedDate DATETIME,
-    WinningCustomerID NVARCHAR(50)
+    WinningCustomerID NVARCHAR(50)---I dont know if it works like this with the sales.customer(customerID)
 )
+/**
+    Something like this for the winning customer
+    
+ALTER TABLE Auction.Auction
+ADD CONSTRAINT FK_Auction_WinnerCustomer
+FOREIGN KEY (WinningCustomerID)
+REFERENCES Sales.Customer(CustomerID);
+
+**/
+/**
+    On FAQ says only one auction can be active per productID
+Maybe we should implemment some CREATE UNIQUE INDEX on Auction.Auction idk
+**/
 
 /**
     Bid
@@ -86,6 +99,15 @@ CREATE TABLE Auction.Bid
     BidDate DATETIME NOT NULL DEFAULT GetDate()
 );
 
+/**
+Create Indexes for high workload like MAX(BIdAmount) maybe 
+CREATE INDEX IX_Bid_AuctionID_BidAmount
+    ON Auction.Bid(AuctionID, BidAmount DESC);
+
+CREATE INDEX IX_Bid_CustomerID_BidDate
+    ON Auction.Bid(CustomerID, BidDate DESC);
+**/
+
 /*Create Global Threshold Table for Bids; applies to all Products*/
 CREATE TABLE Auction.Threshold
 (
@@ -93,6 +115,20 @@ CREATE TABLE Auction.Threshold
     MaximumBidLimit DECIMAL NOT NULL DEFAULT 1
 );
 
+/**Downhere
+If alrteady exist thrshold there's no need to add the line
+We can check the if before adding it
+
+IF NOT EXISTS (SELECT 1 FROM Auction.Threshold)
+BEGIN
+INSERT INTO Auction.Threshold
+    (Increment, MaximumBidLimit)
+VALUES(0.05, 1.0);
+
+END
+GO
+
+**/
 INSERT INTO Auction.Threshold
     (Increment, MaximumBidLimit)
 VALUES(0.05, 1.0);
@@ -101,7 +137,7 @@ GO
 /* Stored Procedures */
 CREATE PROCEDURE Auction.uspAddProductToAuction(
     @ProductID INT,
-    @ExpireDate DATE = NULL,
+    @ExpireDate DATE = NULL,---add specific time with datetime2(0) = null
     @InitialBidPrice MONEY = NULL
 )
 AS
