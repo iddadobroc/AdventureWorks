@@ -1,18 +1,3 @@
-/*SELECT TOP 1 ProductID, ListPrice
-FROM Auction.Product;
-
-INSERT INTO Auction.Auction (ProductID,  ExpireDate)
-VALUES (707,  DATEADD(day, 7, GETUTCDATE()));
-;
-
-SELECT *
-FROM Auction.Auction;
-
-
---Insert manually a new product to test biding
-*/
-
-
 CREATE OR ALTER PROCEDURE Auction.uspTryBidProduct(
     @ProductID INT,
     @CustomerID INT,
@@ -20,94 +5,203 @@ CREATE OR ALTER PROCEDURE Auction.uspTryBidProduct(
 )
 AS
 BEGIN
-    -- This stored procedure adds a bid on behalf of a customer
-    -- Rules:
-    -- - If BidAmount is NULL -> bid = current + increment
-    -- - Bid must be at least current + increment
-    -- - Bid cannot exceed MaximumBidLimit * ListPrice
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
-    DECLARE @ActiveAuction INT;
+    BEGIN TRY
+        DECLARE @ActiveAuction INT;
+        DECLARE @ExpireDate DATETIME2(0);
 
-    SELECT @ActiveAuction = AuctionID
-    FROM Auction.Auction
-    WHERE ProductID = @ProductID
-      AND AuctionStatus = 'Active';
+        DECLARE @inc MONEY;
+        DECLARE @maxmult DECIMAL(10,4);
+        DECLARE @listprice MONEY;
+        DECLARE @maxbid MONEY;
 
-    IF @ActiveAuction IS NULL
-    BEGIN
-        RAISERROR('No active auction for this product.', 16, 1);
-        RETURN;
-    END
+        DECLARE @current MONEY;
+        DECLARE @minnext MONEY;
 
-    DECLARE @inc MONEY;
-    DECLARE @maxmult DECIMAL(10,4);
-    DECLARE @listprice MONEY;
-    DECLARE @maxbid MONEY;
+        -- Get threshold configuration
+        SELECT TOP 1
+            @inc = Increment,
+            @maxmult = MaximumBidLimit
+        FROM Auction.Threshold;
 
-    DECLARE @current MONEY;
-    DECLARE @minnext MONEY;
+        IF @inc IS NULL OR @maxmult IS NULL
+            THROW 50010, 'Threshold configuration missing in Auction.Threshold.', 1;
 
-    -- Get threshold configuration
-    SELECT TOP 1
-        @inc = Increment,
-        @maxmult = MaximumBidLimit
-    FROM Auction.Threshold;
+        -- Get product list price 
+        SELECT @listprice = ListPrice
+        FROM Auction.Product
+        WHERE ProductID = @ProductID;
 
-    -- Get product list price
-    SELECT @listprice = ListPrice
-    FROM Auction.Product
-    WHERE ProductID = @ProductID;
+        IF @listprice IS NULL
+            THROW 50011, 'Invalid ProductID (not found in Auction.Product).', 1;
 
-    SET @maxbid = @maxmult * @listprice;
+        SET @maxbid = @maxmult * @listprice;
 
-    -- Get current bid (or initial bid if no bids yet)
-    SELECT @current = MAX(BidAmount)
-    FROM Auction.Bid
-    WHERE AuctionID = @ActiveAuction;
+        BEGIN TRAN;
 
-    IF @current IS NULL
-    BEGIN
-        SELECT @current = InitialBidPrice
-        FROM Auction.Auction
+        -- Lock the active auction row (concurrency proof with WITH(UPDLOCK, HOLDLOCK)
+        SELECT TOP (1)
+            @ActiveAuction = AuctionID,
+            @ExpireDate = ExpireDate
+        FROM Auction.Auction WITH (UPDLOCK, HOLDLOCK)
+        WHERE ProductID = @ProductID
+          AND AuctionStatus = 'Active'
+        ORDER BY AuctionID DESC;
+
+        IF @ActiveAuction IS NULL
+            THROW 50003, 'No active auction for this product.', 1;
+
+        IF @ExpireDate IS NOT NULL AND @ExpireDate <= SYSUTCDATETIME() ---Check if sys utc current datetime is after the expiry date
+            THROW 50004, 'Auction expired. No more bids allowed.', 1;
+
+        -- Lock bids for this auction when computing current
+        SELECT @current = MAX(BidAmount)
+        FROM Auction.Bid WITH (UPDLOCK, HOLDLOCK)
         WHERE AuctionID = @ActiveAuction;
-    END
 
-    SET @minnext = @current + @inc;
+        IF @current IS NULL
+        BEGIN
+            SELECT @current = InitialBidPrice
+            FROM Auction.Auction
+            WHERE AuctionID = @ActiveAuction;
+        END
 
-    -- If BidAmount is NULL, place minimum valid bid
-    IF @BidAmount IS NULL
-    BEGIN
-        SET @BidAmount = @minnext;
-    END
+        SET @minnext = @current + @inc;
 
-    -- Validate minimum bid FIRST
-    IF @BidAmount < @minnext
-    BEGIN
-        RAISERROR('Bid too low. Must be at least current + increment.', 16, 1);
-        RETURN;
-    END
+        IF @BidAmount IS NULL
+            SET @BidAmount = @minnext;
 
-    -- Apply maximum bid limit
-    IF @BidAmount > @maxbid
-    BEGIN
-        SET @BidAmount = @maxbid;
-    END
+        IF @BidAmount < @minnext
+            THROW 50005, 'Bid too low. Must be at least current + increment.', 1;
 
-    INSERT INTO Auction.Bid
-        (AuctionID, CustomerID, BidAmount)
-    VALUES
-        (@ActiveAuction, @CustomerID, @BidAmount);
+        IF @BidAmount > @maxbid
+            SET @BidAmount = @maxbid;
+
+        INSERT INTO Auction.Bid (AuctionID, CustomerID, BidAmount)
+        VALUES (@ActiveAuction, @CustomerID, @BidAmount);
+
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        THROW;
+    END CATCH
 END
 GO
 
-/*
+-- TEST 1, Purpose: Verify that a product can be successfully added to an auction, Expected result: One ACTIVE auction row created for ProductID = 707
+-- Check if upsAddProductToAuction works, ExpireDate default is calculated and AuctionStatus is "Active" :)
+
+EXEC Auction.uspAddProductToAuction
+    @ProductID = 707;
+
+SELECT *
+FROM Auction.Auction
+WHERE ProductID = 707;
+``
+-- TEST 2
+-- Purpose: Place the FIRST bid using NULL BidAmount
+-- Expected result: BidAmount is automatically set to (InitialBidPrice + Increment)
+-- Checks rule: If BidAmount is NULL -> current + increment
+
 EXEC Auction.uspTryBidProduct
     @ProductID = 707,
     @CustomerID = 3,
-    @BidAmount = 620;
+    @BidAmount = NULL;
 
-SELECT ProductID, ListPrice
-FROM Auction.Product
+SELECT *
+FROM Auction.Bid
+WHERE AuctionID = (
+    SELECT AuctionID
+    FROM Auction.Auction
+    WHERE ProductID = 707
+      AND AuctionStatus = 'Active'
+);
+-- TEST 3
+-- Purpose: Try to place a bid LOWER than the minimum allowed increment
+-- Expected result: Procedure fails with error "Bid too low"
+-- Checks rule: Bid must be at least (current bid + increment)
+
+DECLARE @CurrentBid MONEY;
+
+SELECT @CurrentBid = MAX(BidAmount)
+FROM Auction.Bid
+WHERE AuctionID = (
+    SELECT AuctionID
+    FROM Auction.Auction
+    WHERE ProductID = 707
+      AND AuctionStatus = 'Active'
+);
+
+EXEC Auction.uspTryBidProduct
+    @ProductID = 707,
+    @CustomerID = 3,
+    @BidAmount = @CurrentBid;  -- intentionally invalid (no increment)
+
+-- TEST 4
+-- Purpose: Try to place a bid ABOVE the maximum allowed limit
+-- Expected result: BidAmount is capped to (MaximumBidLimit * ListPrice)
+-- Checks maximum bid enforcement via Auction.Threshold configuration
+
+EXEC Auction.uspTryBidProduct
+    @ProductID = 707,
+    @CustomerID = 3,
+    @BidAmount = 999999;  -- intentionally excessive
+
+SELECT TOP 1 *
+FROM Auction.Bid
+WHERE AuctionID = (
+    SELECT AuctionID
+    FROM Auction.Auction
+    WHERE ProductID = 707
+      AND AuctionStatus = 'Active'
+)
+ORDER BY BidDate DESC;
+
+-- TEST 5
+-- Purpose: Ensure bids are rejected AFTER auction expiration
+-- Expected result: Procedure fails with "Auction expired. No more bids allowed"
+-- Checks expiration logic protection
+
+-- Force auction to be expired
+UPDATE Auction.Auction
+SET ExpireDate = DATEADD(MINUTE, -1, SYSUTCDATETIME())
+WHERE ProductID = 707
+  AND AuctionStatus = 'Active';
+
+EXEC Auction.uspTryBidProduct
+    @ProductID = 707,
+    @CustomerID = 3,
+    @BidAmount = NULL;
+
+
+-- TEST 6
+-- Purpose: Close expired auctions and assign winning customer
+-- Expected result:
+--   - AuctionStatus changes to CLOSED (or equivalent)
+--   - WinningCustomerID is populated with last/highest bidder
+-- Checks uspUpdateProductAuctionStatus business logic
+
+EXEC Auction.uspUpdateProductAuctionStatus;
+
+SELECT
+    AuctionID,
+    ProductID,
+    AuctionStatus,
+    WinningCustomerID,
+    ExpireDate
+FROM Auction.Auction
 WHERE ProductID = 707;
 
-*/
+-- CLEANUP
+-- Purpose: Remove test auction and bids For re run the tests
+
+DELETE FROM Auction.Bid
+WHERE AuctionID IN (
+    SELECT AuctionID FROM Auction.Auction WHERE ProductID = 707
+);
+
+DELETE FROM Auction.Auction
+WHERE ProductID = 707;
